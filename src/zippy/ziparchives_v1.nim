@@ -368,9 +368,7 @@ proc toMsDos(time: times.Time): (uint16, uint16) =
 
   (lastModifiedTime, lastModifiedDate)
 
-proc writeZipArchive*(
-  archive: ZipArchive, path: string
-) {.raises: [IOError, ZippyError].} =
+proc `$`*(archive: ZipArchive): string {.raises: [IOError, ZippyError].} =
   ## Writes archive.contents to a zip file at path.
 
   if archive.contents.len == 0:
@@ -479,7 +477,13 @@ proc writeZipArchive*(
   data.add(cast[array[4, uint8]](centralDirectorySize.uint32))
   data.add(cast[array[4, uint8]](centralDirectoryOffset.uint32))
   data.add([0.uint8, 0])
+  
+proc writeZipArchive*(
+  archive: ZipArchive, path: string
+) {.raises: [IOError, ZippyError].} =
 
+  let data = $(archive)
+  
   when (NimMajor, NimMinor, NimPatch) >= (1, 4, 0):
     writeFile(path, data)
   else:
