@@ -477,6 +477,7 @@ proc `$`*(archive: ZipArchive): string {.raises: [IOError, ZippyError].} =
   data.add(cast[array[4, uint8]](centralDirectorySize.uint32))
   data.add(cast[array[4, uint8]](centralDirectoryOffset.uint32))
   data.add([0.uint8, 0])
+  return cast[string](data)
   
 proc writeZipArchive*(
   archive: ZipArchive, path: string
