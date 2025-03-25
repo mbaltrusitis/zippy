@@ -457,11 +457,22 @@ proc `$`*(archive: ZipArchive): string {.raises: [IOError, ZippyError].} =
     data.add([0.uint8, 0]) # Internal file attrib
 
     # External file attrib
-    case entry.kind:
-    of ekDirectory:
-      data.add([0x10.uint8, 0, 0, 0])
-    of ekFile:
-      data.add([0x20.uint8, 0, 0, 0])
+    var attrs: uint32 = if entry.kind == ekDirectory: 0x10 else: 0x20
+    # Convert Nim's FilePermission enum to Unix-style permissions
+    var unixPerms: uint32 = 0
+    for perm in entry.permissions:
+      case perm:
+      of fpUserRead: unixPerms = unixPerms or TUREAD.uint32
+      of fpUserWrite: unixPerms = unixPerms or TUWRITE.uint32
+      of fpUserExec: unixPerms = unixPerms or TUEXEC.uint32
+      of fpGroupRead: unixPerms = unixPerms or TGREAD.uint32
+      of fpGroupWrite: unixPerms = unixPerms or TGWRITE.uint32
+      of fpGroupExec: unixPerms = unixPerms or TGEXEC.uint32
+      of fpOthersRead: unixPerms = unixPerms or TOREAD.uint32
+      of fpOthersWrite: unixPerms = unixPerms or TOWRITE.uint32
+      of fpOthersExec: unixPerms = unixPerms or TOEXEC.uint32
+    attrs = attrs or (unixPerms shl 16)
+    data.add(cast[array[4, uint8]](attrs))
 
     data.add(cast[array[4, uint8]](v.offset)) # Relative offset of local file header
     data.add(cast[seq[uint8]](path))
