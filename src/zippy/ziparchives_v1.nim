@@ -102,7 +102,7 @@ proc extractPermissions(externalFileAttr: uint32): set[FilePermission] =
     if (permissions and 0o00002) != 0: result.incl fpOthersWrite
     if (permissions and 0o00001) != 0: result.incl fpOthersExec
 
-proc openStreamImpl*(archive: ZipArchive, stream: Stream) =
+proc openStreamImpl*(archive: ZipArchive, stream: Stream) {.raises: [IOError, OSError, ZippyError].} =
   let data = stream.readAll() # TODO: actually treat as a stream
 
   archive.clear()
