@@ -290,5 +290,180 @@ proc inflate*(dst: var string, src: ptr UncheckedArray[uint8], len, pos: int) =
 
   dst.setLen(op)
 
+proc inflateBlock64(
+  dst: var string,
+  b: var BitStreamReader,
+  op: var int,
+  fixedCodes: bool
+) =
+  ## Deflate64-specific block inflation with extended length codes
+  var literalsHuffman, distancesHuffman: Huffman
+  if fixedCodes:
+    literalsHuffman = initHuffman(fixedLitLenCodeLengths)
+    distancesHuffman = initHuffman(fixedDistanceCodeLengths)
+  else:
+    let
+      hlit = b.readBits(5).int + 257
+      hdist = b.readBits(5).int + 1
+      hclen = b.readBits(4).int + 4
+
+    if hlit > maxLitLenCodes:
+      failUncompress()
+
+    if hdist > maxDistanceCodes:
+      failUncompress()
+
+    var clcls: array[19, uint8]
+    for i in 0 ..< hclen:
+      clcls[clclOrder[i]] = b.readBits(3).uint8
+
+    let clclsHuffman = initHuffman(clcls)
+
+    # From RFC 1951, all code lengths form a single sequence of HLIT + HDIST
+    # This means the max unpacked length is 31 + 31 + 257 + 1 = 320
+
+    var
+      unpacked: array[320, uint8]
+      i: int
+    while i != hlit + hdist:
+      if b.bitsBuffered < 15:
+        b.fillBitBuffer()
+      let symbol = decodeSymbol(b, clclsHuffman)
+      if b.bitsBuffered < 0:
+        failEndOfBuffer()
+      if symbol <= 15:
+        unpacked[i] = symbol.uint8
+        inc i
+      elif symbol == 16:
+        if i == 0:
+          failUncompress()
+        let
+          prev = unpacked[i - 1]
+          repeatCount = b.readBits(2).int + 3
+        if i + repeatCount > unpacked.len:
+          failUncompress()
+        for _ in 0 ..< repeatCount:
+          unpacked[i] = prev
+          inc i
+      elif symbol == 17:
+        let repeatZeroCount = b.readBits(3).int + 3
+        i += repeatZeroCount
+      elif symbol == 18:
+        let repeatZeroCount = b.readBits(7).int + 11
+        i += repeatZeroCount
+      else:
+        raise newException(ZippyError, "Invalid symbol")
+
+      if i > hlit + hdist:
+        failUncompress()
+
+    literalsHuffman = initHuffman(unpacked.toOpenArray(0, hlit - 1))
+    distancesHuffman = initHuffman(unpacked.toOpenArray(hlit, hlit + hdist - 1))
+
+  while true:
+    when defined(arm64) and defined(macosx):
+      b.fillBitBuffer()
+      var symbol: uint16
+      while true:
+        symbol = decodeSymbol(b, literalsHuffman)
+        if symbol <= 255 and b.bitsBuffered >= 15:
+          if op >= dst.len:
+            dst.setLen(max(op * 2, 2))
+          dst[op] = symbol.char
+          inc op
+        else:
+          break
+    else:
+      if b.bitsBuffered < 15:
+        b.fillBitBuffer()
+      let symbol = decodeSymbol(b, literalsHuffman)
+    if b.bitsBuffered < 0:
+      failEndOfBuffer()
+    if symbol <= 255:
+      if op >= dst.len:
+        dst.setLen(max(op * 2, 2))
+      dst[op] = symbol.char
+      inc op
+    elif symbol == 256:
+      break
+    else:
+      b.fillBitBuffer()
+
+      let lengthIdx = (symbol - 257).int
+      
+      # Handle deflate64 extended length codes
+      if lengthIdx < 0 or lengthIdx >= baseLengths64.len:
+        failUncompress()
+        
+      let copyLength = (baseLengths64[lengthIdx] + 
+                       b.readBits(baseLengthsExtraBits64[lengthIdx].int, false)).int
+
+      let distanceIdx = decodeSymbol(b, distancesHuffman) # Up to 15
+      if distanceIdx >= baseDistances.len.uint16:
+        failUncompress()
+
+      when sizeof(b.bitBuffer) == 4:
+        if b.bitsBuffered < 13:
+          b.fillBitBuffer()
+
+      let distance = (
+        baseDistances[distanceIdx] +
+        b.readBits(baseDistanceExtraBits[distanceIdx].int, false) # Up to 13
+      ).int
+
+      if distance > op:
+        failUncompress()
+
+      # Min match is 3 so leave room to overwrite by 13
+      if op + copyLength + 13 > dst.len:
+        dst.setLen((op + copyLength) * 2 + 10) # At least 16
+
+      let dst = cast[ptr UncheckedArray[uint8]](dst[0].addr)
+
+      if copyLength <= 16 and distance >= 8:
+        copy64(dst, dst, op, op - distance)
+        copy64(dst, dst, op + 8, op - distance + 8)
+      else:
+        var
+          copyFrom = op - distance
+          copyTo = op
+          remaining = copyLength
+        while copyTo - copyFrom < 8:
+          copy64(dst, dst, copyTo, copyFrom)
+          remaining -= copyTo - copyFrom
+          copyTo += copyTo - copyFrom
+        while remaining > 0:
+          copy64(dst, dst, copyTo, copyFrom)
+          copyFrom += 8
+          copyTo += 8
+          remaining -= 8
+      op += copyLength
+
+proc inflate64*(dst: var string, src: ptr UncheckedArray[uint8], len, pos: int) =
+  ## Deflate64 decompression
+  var
+    b = BitStreamReader(src: src, len: len, pos: pos)
+    op: int
+    finalBlock: bool
+  while not finalBlock:
+    let
+      bfinal = b.readBits(1)
+      btype = b.readBits(2)
+
+    if bfinal != 0.uint16:
+      finalBlock = true
+
+    case btype:
+    of 0: # No compression
+      inflateNoCompression(dst, b, op)
+    of 1: # Compressed with fixed Huffman codes
+      inflateBlock64(dst, b, op, true)
+    of 2: # Compressed with dynamic Huffman codes
+      inflateBlock64(dst, b, op, false)
+    else:
+      raise newException(ZippyError, "Invalid block header")
+
+  dst.setLen(op)
+
 when defined(release):
   {.pop.}
