@@ -176,6 +176,33 @@ proc encodeAllLiterals(
   metadata.litLenFreq[256] = 1 # Alway 1 end-of-block symbol
   metadata.numLiterals = len
 
+# Overload for deflate64 metadata
+proc encodeAllLiterals(
+  encoding: var seq[uint16],
+  ep: var int,
+  metadata: var BlockMetadata64,
+  src: ptr UncheckedArray[uint8],
+  start, len: int
+) =
+  for i in 0 ..< len:
+    inc metadata.litLenFreq[src[start + i]]
+
+  let
+    a = len div maxLiteralLength
+    b = len mod maxLiteralLength
+    c = a + (if b > 0: 1 else: 0)
+  if ep + c > encoding.len:
+    encoding.setLen(ep + c)
+  for i in 0 ..< a:
+    encoding[ep] = maxLiteralLength.uint16
+    inc ep
+  if b > 0:
+    encoding[ep] = b.uint16
+    inc ep
+
+  metadata.litLenFreq[256] = 1 # Alway 1 end-of-block symbol
+  metadata.numLiterals = len
+
 proc addNoCompressionBlock(
   b: var BitStreamWriter,
   dst: var string,
@@ -407,6 +434,273 @@ proc deflate*(dst: var string, src: ptr UncheckedArray[uint8], len, level: int) 
             distanceIndex = value and uint8.high
             lengthExtraBits = baseLengthsExtraBits[lengthIndex].int
             lengthExtra = length - baseLengths[lengthIndex]
+            distanceExtraBits = baseDistanceExtraBits[distanceIndex].int
+            distanceExtra = offset - baseDistances[distanceIndex]
+
+          encPos += 3
+          srcPos += length.int
+
+          var
+            buf = litLenCodes[lengthIndex + 257].uint64
+            bitLen = litLenCodeLengths[lengthIndex + 257].int
+          buf = buf or (lengthExtra.uint64 shl bitLen)
+          bitLen += lengthExtraBits
+
+          buf = buf or (distanceCodes[distanceIndex].uint64 shl bitLen)
+          bitLen += distanceCodeLengths[distanceIndex].int
+          buf = buf or (distanceExtra.uint64 shl bitLen)
+          bitLen += distanceExtraBits
+
+          let firstAddLen = min(bitLen, 32)
+          b.addBits(dst, buf.uint32, firstAddLen)
+          buf = buf shr firstAddLen
+          bitLen -= firstAddLen
+
+          if bitLen > 0:
+            b.addBits(dst, buf.uint32, bitLen)
+
+        else:
+          let literalsLength = encoding[encPos].int
+          inc encPos
+
+          var
+            buf: uint32
+            bitLen: int
+          for _ in 0 ..< literalsLength:
+            let codeLength = litLenCodeLengths[src[srcPos]].int
+            if bitLen + codeLength > 32:
+              # Flush
+              b.addBits(dst, buf, bitLen)
+              buf = 0
+              bitLen = 0
+            buf = buf or litLenCodes[src[srcPos]].uint32 shl bitLen
+            bitLen += codeLength
+            inc srcPos
+
+          if bitLen > 0:
+            b.addBits(dst, buf, bitLen)
+
+      if encPos != encodingLen:
+        failUncompress()
+
+      assert srcPos == blockStart + blockLen
+
+    if litLenCodeLengths[256] == 0:
+      failCompress()
+
+    b.addBits(dst, litLenCodes[256], litLenCodeLengths[256].int) # End of block
+
+  b.skipRemainingBitsInCurrentByte()
+  dst.setLen(b.pos)
+
+proc deflate64*(dst: var string, src: ptr UncheckedArray[uint8], len, level: int) =
+  ## Deflate64 compression with 64KB window and extended match lengths
+  if level < -2 or level > 9:
+    raise newException(ZippyError, "Invalid compression level " & $level)
+
+  var b: BitStreamWriter
+  b.pos = dst.len
+
+  if level == 0:
+    let blockCount = max(
+      (len + maxUncompressedBlockSize - 1) div maxUncompressedBlockSize,
+      1
+    )
+    for blockNum in 0 ..< blockCount:
+      let
+        finalBlock = blockNum == (blockCount - 1)
+        blockStart = blockNum * maxUncompressedBlockSize
+        blockLen = min(len - blockStart, maxUncompressedBlockSize)
+      b.addNoCompressionBlock(dst, src, blockStart, blockLen, finalBlock)
+    dst.setLen(b.pos)
+    return
+
+  let blockCount = max((len + maxBlockSize - 1) div maxBlockSize, 1)
+
+  var
+    encoding: seq[uint16]
+    encodingLen: int
+  for blockNum in 0 ..< blockCount:
+    let
+      blockStart = blockNum * maxBlockSize
+      blockLen = min(len - blockStart, maxBlockSize)
+      finalBlock = blockNum == (blockCount - 1)
+
+    encodingLen = 0
+
+    var metadata: BlockMetadata64
+
+    case level:
+    of -2:
+      encodeAllLiterals(
+        encoding,
+        encodingLen,
+        metadata,
+        src,
+        blockStart,
+        blockLen
+      )
+    of 1:
+      encodeSnappy(
+        encoding,
+        encodingLen,
+        metadata,
+        src,
+        blockStart,
+        blockLen
+      )
+    else:
+      # -1 or [2, 9] - use deflate64-specific LZ77 encoding
+      encodeLz77_64(
+        encoding,
+        encodingLen,
+        configurationTable64[if level == -1: 6 else: level],
+        metadata,
+        src,
+        blockStart,
+        blockLen
+      )
+
+    # If encoding returned almost all literals then write uncompressed.
+    if level != -2 and metadata.numLiterals >= (blockLen.float32 * 0.98).int:
+      b.addNoCompressionBlock(dst, src, blockStart, blockLen, finalBlock)
+      continue
+
+    let
+      useFixedCodes = level <= 6 and blockLen <= 2048
+      (litLenCodes, litLenCodeLengths) = block:
+        if useFixedCodes:
+          (fixedLitLenCodes, fixedLitLenCodeLengths)
+        else:
+          huffmanCodes(metadata.litLenFreq, 257, maxCodeLength)
+      (distanceCodes, distanceCodeLengths) = block:
+        if useFixedCodes:
+          (fixedDistanceCodes, fixedDistanceCodeLengths)
+        else:
+          huffmanCodes(metadata.distanceFreq, 2, maxCodeLength)
+
+    if useFixedCodes:
+      b.addBits(dst, if finalBlock: 1 else: 0, 1)
+      b.addBits(dst, 1, 2) # Fixed Huffman codes
+    else:
+      var
+        codeLengths: array[maxLitLenCodes + maxDistanceCodes, uint8]
+        numCodes = litLenCodes.len + distanceCodes.len
+      block:
+        var cli: int
+        for i in 0 ..< litLenCodes.len:
+          codeLengths[cli] = litLenCodeLengths[i]
+          inc cli
+        for i in 0 ..< distanceCodes.len:
+          codeLengths[cli] = distanceCodeLengths[i]
+          inc cli
+
+      var codeLengthsRle: seq[uint8]
+      block:
+        var i: int
+        while i < numCodes:
+          var repeatCount: int
+          while i + repeatCount + 1 < numCodes and
+            codeLengths[i + repeatCount + 1] == codeLengths[i]:
+            inc repeatCount
+
+          if codeLengths[i] == 0 and repeatCount >= 2:
+            inc repeatCount # Initial zero
+            if repeatCount <= 10:
+              codeLengthsRle.add(17)
+              codeLengthsRle.add(repeatCount.uint8 - 3)
+            else:
+              repeatCount = min(repeatCount, 138) # Max of 138 zeros for code 18
+              codeLengthsRle.add(18)
+              codeLengthsRle.add(repeatCount.uint8 - 11)
+            i += repeatCount - 1
+          elif repeatCount >= 3: # Repeat code for non-zero, must be >= 3 times
+            var
+              a = repeatCount div 6
+              b = repeatCount mod 6
+            codeLengthsRle.add(codeLengths[i])
+            for j in 0 ..< a:
+              codeLengthsRle.add(16)
+              codeLengthsRle.add(3)
+            if b >= 3:
+              codeLengthsRle.add(16)
+              codeLengthsRle.add(b.uint8 - 3)
+            else:
+              repeatCount -= b
+            i += repeatCount
+          else:
+            codeLengthsRle.add(codeLengths[i])
+          inc i
+
+      var clFreq: array[19, uint32]
+      block:
+        var i: int
+        while i < codeLengthsRle.len:
+          inc clFreq[codeLengthsRle[i]]
+          # Skip the number of times codes are repeated
+          if codeLengthsRle[i] >= 16.uint8:
+            inc i
+          inc i
+
+      let (clCodes, clCodeLengths) = huffmanCodes(clFreq, clFreq.len, 7)
+
+      var clclOrdered: array[19, uint16]
+      for i in 0 ..< clclOrdered.len:
+        clclOrdered[i] = clCodeLengths[clclOrder[i]]
+
+      var hclen = clclOrdered.len
+      while clclOrdered[hclen - 1] == 0 and clclOrdered.len > 4:
+        dec hclen
+      hclen -= 4
+
+      let
+        hlit = litLenCodes.len - firstLengthCodeIndex
+        hdist = distanceCodes.len - 1
+
+      b.addBits(dst, if finalBlock: 1 else: 0, 1)
+      b.addBits(dst, 2, 2) # Dynamic Huffman codes
+
+      b.addBits(dst, hlit.uint32, 5)
+      b.addBits(dst, hdist.uint32, 5)
+      b.addBits(dst, hclen.uint32, 4)
+
+      for i in 0 ..< hclen + 4:
+        b.addBits(dst, clclOrdered[i], 3)
+
+      block:
+        var i: int
+        while i < codeLengthsRle.len:
+          let symbol = codeLengthsRle[i]
+          b.addBits(dst, clCodes[symbol], clCodeLengths[symbol].int)
+          inc i
+          if symbol == 16:
+            b.addBits(dst, codeLengthsRle[i], 2)
+            inc i
+          elif symbol == 17:
+            b.addBits(dst, codeLengthsRle[i], 3)
+            inc i
+          elif symbol == 18:
+            b.addBits(dst, codeLengthsRle[i], 7)
+            inc i
+
+    # Encoding processing - handle deflate64 extended length codes
+    block:
+      var
+        srcPos = blockStart
+        encPos: int
+      while encPos < encodingLen:
+        if (encoding[encPos] and (1 shl 15)) != 0:
+          let
+            value = encoding[encPos + 0]
+            offset = encoding[encPos + 1]
+            length = encoding[encPos + 2]
+            lengthIndex = (value shr 8) and (uint8.high shr 1)
+            distanceIndex = value and uint8.high
+
+          # Use deflate64 extended length tables
+          let
+            lengthExtraBits = baseLengthsExtraBits64[lengthIndex].int
+            lengthExtra = length - baseLengths64[lengthIndex]
             distanceExtraBits = baseDistanceExtraBits[distanceIndex].int
             distanceExtra = offset - baseDistances[distanceIndex]
 
