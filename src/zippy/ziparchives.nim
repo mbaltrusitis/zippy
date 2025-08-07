@@ -1,5 +1,5 @@
-import common, crc, internal, std/memfiles, std/os, std/strutils, std/tables,
-    std/times, std/unicode, ziparchives_v1, zippy
+import common, crc, inflate, internal, std/memfiles, std/os, std/strutils, std/tables,
+    std/times, std/unicode, ziparchives_v1
 
 export common, ziparchives_v1
 
@@ -81,9 +81,9 @@ proc extractFile*(
         result.setLen(record.compressedSize)
         copyMem(result[0].addr, src[pos].addr, record.compressedSize)
     elif compressionMethod == 8: # Deflate
-      result = uncompress(src[pos].addr, record.compressedSize, dfDeflate)
+      inflate(result, cast[ptr UncheckedArray[uint8]](src[pos].addr), record.compressedSize, 0)
     elif compressionMethod == 9: # Deflate64
-      result = uncompress(src[pos].addr, record.compressedSize, dfDeflate64)
+      inflate64(result, cast[ptr UncheckedArray[uint8]](src[pos].addr), record.compressedSize, 0)
     else:
       raise newException(ZippyError, "Unsupported archive, compression method")
   of DirectoryRecord:

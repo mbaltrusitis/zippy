@@ -1,5 +1,5 @@
-import common, crc, internal, std/os, std/streams, std/strutils, std/tables,
-    std/times, zippy
+import common, crc, deflate, inflate, internal, std/os, std/streams, std/strutils, std/tables,
+    std/times
 
 export common
 
@@ -203,7 +203,10 @@ proc openStreamImpl*(archive: ZipArchive, stream: Stream) {.raises: [IOError, OS
         if compressionMethod == 0:
           data[pos ..< pos + compressedSize]
         else:
-          uncompress(data[pos ..< pos + compressedSize], dfDeflate)
+          block:
+            var result: string
+            inflate(result, cast[ptr UncheckedArray[uint8]](data[pos].addr), compressedSize, 0)
+            result
 
       if crc32(uncompressed) != uncompressedCrc32:
         raise newException(
@@ -408,7 +411,10 @@ proc `$`*(archive: ZipArchive): string {.raises: [IOError, ZippyError].} =
 
     let compressed =
       if entry.contents.len > 0:
-        compress(entry.contents, DefaultCompression, dfDeflate)
+        block:
+          var result: string
+          deflate(result, cast[ptr UncheckedArray[uint8]](entry.contents[0].addr), entry.contents.len, DefaultCompression)
+          result
       else:
         ""
 
