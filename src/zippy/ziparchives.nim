@@ -82,6 +82,8 @@ proc extractFile*(
         copyMem(result[0].addr, src[pos].addr, record.compressedSize)
     elif compressionMethod == 8: # Deflate
       result = uncompress(src[pos].addr, record.compressedSize, dfDeflate)
+    elif compressionMethod == 9: # Deflate64
+      result = uncompress(src[pos].addr, record.compressedSize, dfDeflate64)
     else:
       raise newException(ZippyError, "Unsupported archive, compression method")
   of DirectoryRecord:
@@ -291,7 +293,7 @@ proc openZipArchive*(
         # internalFileAttr = read16(src, pos + 36)
         externalFileAttr = read32(src, pos + 38)
 
-      if compressionMethod notin [0.uint16, 8]:
+      if compressionMethod notin [0.uint16, 8, 9]:
         raise newException(ZippyError, "Unsupported archive, compression method")
 
       if fileDiskNumber != 0:
