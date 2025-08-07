@@ -162,5 +162,44 @@ proc encodeSnappy*(
     )
     pos += bytesToRead
 
+# Overload for deflate64 metadata
+proc encodeSnappy*(
+  encoding: var seq[uint16],
+  ep: var int,
+  metadata: var BlockMetadata64,
+  src: ptr UncheckedArray[uint8],
+  blockStart, blockLen: int
+) =
+  metadata.litLenFreq[256] = 1 # Alway 1 end-of-block symbol
+
+  var
+    pos = blockStart
+    compressTable: array[maxCompressTableSize, uint16]
+  while pos < blockStart + blockLen:
+    let
+      fragmentSize = blockStart + blockLen - pos
+      bytesToRead = min(fragmentSize, maxWindowSize)
+    
+    # Use the same algorithm as the original encodeSnappy
+    # but convert metadata temporarily
+    var castMetadata = cast[ptr BlockMetadata](addr metadata)[]
+    encodeFragment(
+      encoding,
+      castMetadata,
+      src,
+      ep,
+      pos,
+      bytesToRead,
+      compressTable
+    )
+    # Copy back the updated counts
+    for i in 0 ..< min(metadata.litLenFreq.len, castMetadata.litLenFreq.len):
+      metadata.litLenFreq[i] = castMetadata.litLenFreq[i]
+    metadata.numLiterals = castMetadata.numLiterals
+    for i in 0 ..< metadata.distanceFreq.len:
+      metadata.distanceFreq[i] = castMetadata.distanceFreq[i]
+    
+    pos += bytesToRead
+
 when defined(release):
   {.pop.}
