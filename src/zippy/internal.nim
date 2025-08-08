@@ -12,12 +12,14 @@ const
   maxDistanceCodes* = 30
   maxFixedLitLenCodes* = 288
   maxWindowSize* = 32768
+  maxWindowSize64* = 65536  # Deflate64 window size
   maxUncompressedBlockSize* = 65535
   maxBlockSize* = 4194304
   firstLengthCodeIndex* = 257
   baseMatchLen* = 3
   minMatchLen* = 4
   maxMatchLen* = 258
+  maxMatchLen64* = 65535    # Deflate64 max match length
 
   # For run length encodings (lz77, snappy), the uint16 high bit is reserved
   # to signal that a offset and length are encoded in the uint16.
@@ -41,6 +43,29 @@ const
     4, 4, 4, 4, # 278 - 280
     5, 5, 5, 5, # 281 - 284
     0 # 285
+  ]
+
+  # Deflate64 extended length tables (codes 286-287 for matches 259-65535)
+  baseLengths64* = [
+    3.uint16, 4, 5, 6, 7, 8, 9, 10, # 257 - 264
+    11, 13, 15, 17, # 265 - 268
+    19, 23, 27, 31, # 269 - 273
+    35, 43, 51, 59, # 274 - 276
+    67, 83, 99, 115, # 278 - 280
+    131, 163, 195, 227, # 281 - 284
+    258, # 285
+    259, 65535 # 286-287 (deflate64 extensions)
+  ]
+
+  baseLengthsExtraBits64* = [
+    0.uint8, 0, 0, 0, 0, 0, 0, 0, # 257 - 264
+    1, 1, 1, 1, # 265 - 268
+    2, 2, 2, 2, # 269 - 273
+    3, 3, 3, 3, # 274 - 276
+    4, 4, 4, 4, # 278 - 280
+    5, 5, 5, 5, # 281 - 284
+    0, # 285
+    0, 16 # 286-287 (deflate64 extensions: 259 fixed, 259+0..65535)
   ]
 
   baseLengthIndices* = [
@@ -130,6 +155,12 @@ type
     distanceFreq*: array[maxDistanceCodes, uint32]
     numLiterals*: int
 
+  # Deflate64 needs extended length codes 286-287
+  BlockMetadata64* = object
+    litLenFreq*: array[maxLitLenCodes + 2, uint32]  # Extended for codes 286-287
+    distanceFreq*: array[maxDistanceCodes, uint32]
+    numLiterals*: int
+
 proc makeCodes(lengths: seq[uint8]): seq[uint16] =
   result = newSeq[uint16](lengths.len)
 
@@ -188,6 +219,21 @@ const
     CompressionConfig(good: 32, lazy: 258, nice: 258, chain: 4096) # Max compression
   ]
 
+  # Deflate64 configurations with longer match lengths and larger window
+  configurationTable64* = [
+    ## Deflate64 configurations adapted for 64KB window and longer matches
+    CompressionConfig(), # No compression
+    CompressionConfig(good: 4, lazy: 4, nice: 16, chain: 8),
+    CompressionConfig(good: 8, lazy: 8, nice: 32, chain: 16),
+    CompressionConfig(good: 8, lazy: 16, nice: 64, chain: 64),
+    CompressionConfig(good: 16, lazy: 16, nice: 128, chain: 128),
+    CompressionConfig(good: 16, lazy: 32, nice: 256, chain: 256),
+    CompressionConfig(good: 32, lazy: 64, nice: 512, chain: 512), # Default
+    CompressionConfig(good: 64, lazy: 128, nice: 1024, chain: 1024),
+    CompressionConfig(good: 128, lazy: 256, nice: 2048, chain: 2048),
+    CompressionConfig(good: 256, lazy: 512, nice: 4096, chain: 4096) # Max compression
+  ]
+
 template failUncompress*() =
   raise newException(ZippyError, "Invalid buffer, unable to uncompress")
 
@@ -196,6 +242,22 @@ template failCompress*() =
 
 template failArchiveEOF*() =
   raise newException(ZippyError, "Unexpected EOF, invalid archive?")
+
+# Extended indices for deflate64 - maps (length - baseMatchLen) to code indices
+# For length offsets 256-65532, we use codes 286-287 (indices 29-30)
+proc baseLengthIndex64*(lengthOffset: int): uint8 =
+  # Bounds check to prevent overflow
+  if lengthOffset < 0:
+    return 0  # Invalid, will be caught by caller
+  elif lengthOffset < baseLengthIndices.len:
+    baseLengthIndices[lengthOffset]  # Use standard table for lengths 3-258
+  elif lengthOffset == 256:  # length 259 (259 - 3 = 256)
+    29  # Code 286 -> index 29  
+  elif lengthOffset <= 65532:  # lengths 260-65535 (offsets 257-65532)
+    30  # Code 287 -> index 30 (259 + 16-bit extra)
+  else:
+    # Invalid length offset beyond deflate64 maximum
+    30  # Clamp to maximum valid index
 
 when defined(release):
   {.push checks: off.}
