@@ -58,6 +58,9 @@ proc compress*(
   of dfDeflate:
     deflate(result, src, len, level)
 
+  of dfDeflate64:
+    deflate64(result, src, len, level)
+
   else:
     raise newException(ZippyError, "Invalid data format " & $dfDetect)
 
@@ -141,6 +144,9 @@ proc uncompress*(
 
   of dfDeflate:
     inflate(result, src, len, 0)
+
+  of dfDeflate64:
+    inflate64(result, src, len, 0)
 
 proc uncompress*(
   src: string,
