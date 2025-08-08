@@ -1,1 +1,1 @@
-import test, test_known_bad, test_levels, test_tarballs, test_ziparchives
+import test, test_known_bad, test_levels, test_tarballs, test_ziparchives, test_deflate64
