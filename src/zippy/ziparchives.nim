@@ -1,5 +1,5 @@
-import common, crc, internal, std/memfiles, std/os, std/strutils, std/tables,
-    std/times, std/unicode, ziparchives_v1, zippy
+import common, crc, inflate, internal, std/memfiles, std/os, std/streams, std/strutils, std/tables,
+    std/times, std/unicode, ziparchives_v1
 
 export common, ziparchives_v1
 
@@ -23,9 +23,38 @@ type
     uncompressedSize: int
     filePermissions: set[FilePermission]
 
-  ZipArchiveReader = ref object
-    memFile: MemFile
-    records: Table[string, ZipArchiveRecord]
+  ZipArchiveReaderKind* = enum
+    FromPath, FromStream
+
+  ZipArchiveReader* = ref object
+    kind: ZipArchiveReaderKind
+    records*: Table[string, ZipArchiveRecord]
+    size: int
+    case srcKind: ZipArchiveReaderKind
+    of FromPath:
+      memFile: MemFile
+    of FromStream:
+      data: string
+
+proc getData(reader: ZipArchiveReader): ptr UncheckedArray[uint8] =
+  case reader.srcKind:
+  of FromPath:
+    cast[ptr UncheckedArray[uint8]](reader.memFile.mem)
+  of FromStream:
+    cast[ptr UncheckedArray[uint8]](reader.data[0].addr)
+
+proc getSize(reader: ZipArchiveReader): int =
+  case reader.srcKind:
+  of FromPath:
+    reader.memFile.size
+  of FromStream:
+    reader.size
+
+proc readStr(src: ptr UncheckedArray[uint8], pos: int, len: int): string =
+  ## Read a string from UncheckedArray at position pos with length len
+  result.setLen(len)
+  if len > 0:
+    copyMem(result[0].addr, src[pos].addr, len)
 
 iterator walkFiles*(reader: ZipArchiveReader): string =
   ## Walks over all files in the archive and returns the file name
@@ -42,7 +71,7 @@ proc extractFile*(
     raise newException(ZippyError, "No file record found for " & path)
 
   let
-    src = cast[ptr UncheckedArray[uint8]](reader.memFile.mem)
+    src = reader.getData()
     record =
       try:
         reader.records[path]
@@ -51,7 +80,7 @@ proc extractFile*(
 
   var pos = record.fileHeaderOffset
 
-  if pos + 30 > reader.memFile.size:
+  if pos + 30 > reader.getSize():
     failArchiveEOF()
 
   if read32(src, pos) != fileHeaderSignature:
@@ -71,7 +100,7 @@ proc extractFile*(
 
   pos += 30 + fileNameLen + extraFieldLen
 
-  if pos + record.compressedSize > reader.memFile.size:
+  if pos + record.compressedSize > reader.getSize():
     failArchiveEOF()
 
   case record.kind:
@@ -81,7 +110,9 @@ proc extractFile*(
         result.setLen(record.compressedSize)
         copyMem(result[0].addr, src[pos].addr, record.compressedSize)
     elif compressionMethod == 8: # Deflate
-      result = uncompress(src[pos].addr, record.compressedSize, dfDeflate)
+      inflate(result, cast[ptr UncheckedArray[uint8]](src[pos].addr), record.compressedSize, 0)
+    elif compressionMethod == 9: # Deflate64
+      inflate64(result, cast[ptr UncheckedArray[uint8]](src[pos].addr), record.compressedSize, 0)
     else:
       raise newException(ZippyError, "Unsupported archive, compression method")
   of DirectoryRecord:
@@ -91,7 +122,11 @@ proc extractFile*(
     raise newException(ZippyError, "Verifying crc32 failed")
 
 proc close*(reader: ZipArchiveReader) {.raises: [OSError].} =
-  reader.memFile.close()
+  case reader.srcKind:
+  of FromPath:
+    reader.memFile.close()
+  of FromStream:
+    discard # Nothing to close for stream data
 
 proc parseMsDosDateTime(time, date: uint16): Time =
   let
@@ -153,9 +188,9 @@ proc utf8ify(fileName: string): string =
   $runes
 
 proc findEndOfCentralDirectory(reader: ZipArchiveReader): int =
-  let src = cast[ptr UncheckedArray[uint8]](reader.memFile.mem)
+  let src = reader.getData()
 
-  result = reader.memFile.size - 22 # Work backwards in the file starting here
+  result = reader.getSize() - 22 # Work backwards in the file starting here
   while true:
     if result < 0:
       failArchiveEOF()
@@ -168,7 +203,7 @@ proc findStartOfCentralDirectory(
   reader: ZipArchiveReader,
   start, numRecordEntries: int
 ): int =
-  let src = cast[ptr UncheckedArray[uint8]](reader.memFile.mem)
+  let src = reader.getData()
 
   result = start # Work backwards in the file starting here
   var numRecordsFound: int
@@ -184,14 +219,15 @@ proc findStartOfCentralDirectory(
 proc openZipArchive*(
   zipPath: string
 ): ZipArchiveReader {.raises: [IOError, OSError, ZippyError].} =
-  result = ZipArchiveReader()
+  result = ZipArchiveReader(kind: FromPath, srcKind: FromPath)
   result.memFile = memfiles.open(zipPath)
+  result.size = result.memFile.size
 
   try:
-    let src = cast[ptr UncheckedArray[uint8]](result.memFile.mem)
+    let src = result.getData()
 
     let eocd = result.findEndOfCentralDirectory()
-    if eocd + 22 > result.memFile.size:
+    if eocd + 22 > result.getSize():
       failArchiveEOF()
 
     var zip64 = false
@@ -215,7 +251,7 @@ proc openZipArchive*(
         raise newException(ZippyError, "Unsupported archive, num disks")
 
       var pos = zip64EndOfCentralDirectoryStart
-      if pos + 64 > result.memFile.size:
+      if pos + 64 > result.getSize():
         failArchiveEOF()
 
       if read32(src, pos) != zip64EndOfCentralDirectorySignature:
@@ -266,11 +302,11 @@ proc openZipArchive*(
 
     var pos = socdOffset + centralDirectoryStart
 
-    if eocd + 22 > result.memFile.size:
+    if eocd + 22 > result.getSize():
       failArchiveEOF()
 
     for _ in 0 ..< numCentralDirectoryRecords:
-      if pos + 46 > result.memFile.size:
+      if pos + 46 > result.getSize():
         failArchiveEOF()
 
       if read32(src, pos) != centralDirectoryFileHeaderSignature:
@@ -291,7 +327,7 @@ proc openZipArchive*(
         # internalFileAttr = read16(src, pos + 36)
         externalFileAttr = read32(src, pos + 38)
 
-      if compressionMethod notin [0.uint16, 8]:
+      if compressionMethod notin [0.uint16, 8, 9]:
         raise newException(ZippyError, "Unsupported archive, compression method")
 
       if fileDiskNumber != 0:
@@ -304,7 +340,7 @@ proc openZipArchive*(
 
       pos += 46
 
-      if pos + fileNameLen > result.memFile.size:
+      if pos + fileNameLen > result.getSize():
         failArchiveEOF()
 
       var fileName = newString(fileNameLen)
@@ -319,7 +355,7 @@ proc openZipArchive*(
         var extraFieldsOffset = pos
 
         while extraFieldsOffset < pos + extraFieldLen:
-          if pos + 4 > result.memFile.size:
+          if pos + 4 > result.getSize():
             failArchiveEOF()
 
           let
@@ -393,6 +429,214 @@ proc openZipArchive*(
     result.close()
     raise e
 
+proc openZipArchive*(
+  stream: Stream
+): ZipArchiveReader {.raises: [IOError, OSError, ZippyError].} =
+  ## Opens a zip archive from a stream with deflate64 support
+  result = ZipArchiveReader(kind: FromStream, srcKind: FromStream)
+  result.data = stream.readAll()
+  result.size = result.data.len
+
+  try:
+    let src = result.getData()
+
+    let eocd = result.findEndOfCentralDirectory()
+    if eocd + 22 > result.getSize():
+      failArchiveEOF()
+
+    var zip64 = false
+    if eocd - 20 >= 0:
+      if read32(src, eocd - 20) == zip64EndOfCentralDirectoryLocatorSignature:
+        zip64 = true
+
+    var
+      diskNumber, startDisk, numRecordsOnDisk, numCentralDirectoryRecords: int
+      centralDirectorySize, centralDirectoryStart: int
+    if zip64:
+      var pos = eocd - 20
+      if pos + 20 > result.getSize():
+        failArchiveEOF()
+
+      let
+        zip64EOCDOffset = read64(src, pos + 8).int
+        # diskNumberWithZip64EOCD = read32(src, pos + 16)
+        # totalNumberOfDisks = read32(src, pos + 20)
+
+      pos = zip64EOCDOffset
+      if pos + 56 > result.getSize():
+        failArchiveEOF()
+
+      if read32(src, pos) != zip64EndOfCentralDirectorySignature:
+        failArchiveEOF()
+
+      let
+        # zip64EOCDRecordSize = read64(src, pos + 4)
+        # madeByVersion = read16(src, pos + 12)
+        # minVersionToExtract = read16(src, pos + 14)
+        # diskNumber2 = read32(src, pos + 16)
+        # startDisk2 = read32(src, pos + 20)
+        numRecordsOnDisk2 = read64(src, pos + 24)
+        numCentralDirectoryRecords2 = read64(src, pos + 32)
+        centralDirectorySize2 = read64(src, pos + 40)
+        centralDirectoryStart2 = read64(src, pos + 48)
+
+      if numRecordsOnDisk2.int > int.high or
+         numCentralDirectoryRecords2.int > int.high or
+         centralDirectorySize2.int > int.high or
+         centralDirectoryStart2.int > int.high:
+        failArchiveEOF()
+
+      diskNumber = 0
+      startDisk = 0
+      numRecordsOnDisk = numRecordsOnDisk2.int
+      numCentralDirectoryRecords = numCentralDirectoryRecords2.int
+      centralDirectorySize = centralDirectorySize2.int
+      centralDirectoryStart = centralDirectoryStart2.int
+    else:
+      if eocd + 22 > result.getSize():
+        failArchiveEOF()
+
+      diskNumber = read16(src, eocd + 4).int
+      startDisk = read16(src, eocd + 6).int
+      numRecordsOnDisk = read16(src, eocd + 8).int
+      numCentralDirectoryRecords = read16(src, eocd + 10).int
+      centralDirectorySize = read32(src, eocd + 12).int
+      centralDirectoryStart = read32(src, eocd + 16).int
+
+    if diskNumber != 0 or startDisk != 0:
+      raise newException(ZippyError, "Multi-disk zip archives are not supported")
+
+    if numRecordsOnDisk != numCentralDirectoryRecords:
+      raise newException(ZippyError, "Number of entries mismatch")
+
+    # Handle zip archives being concatenated to the end (like self-extracting
+    # exe). This handles that by determining where the zip archive is from
+    # the start of the file.
+    let
+      socd =
+        try:
+          # Try to find the start relative to the end of the file, supporting
+          # zip archives being concatenated to the end. If this fails for any
+          # reason, fall back to the default behavior.
+          result.findStartOfCentralDirectory(eocd, numCentralDirectoryRecords)
+        except ZippyError:
+          centralDirectoryStart
+      socdOffset = socd - centralDirectoryStart
+
+    var pos = socdOffset + centralDirectoryStart
+    for i in 0 ..< numCentralDirectoryRecords:
+      if pos + 46 > result.getSize():
+        failArchiveEOF()
+
+      if read32(src, pos) != centralDirectoryFileHeaderSignature:
+        raise newException(ZippyError, "Invalid central directory file header signature")
+
+      let
+        # madeByVersion = read16(src, pos + 4)
+        # minVersionToExtract = read16(src, pos + 6)
+        generalPurposeFlag = read16(src, pos + 8)
+        # compressionMethod = read16(src, pos + 10)
+        # lastModifiedTime = read16(src, pos + 12)
+        # lastModifiedDate = read16(src, pos + 14)
+        uncompressedCrc32 = read32(src, pos + 16)
+        compressedSize = read32(src, pos + 20).int
+        uncompressedSize = read32(src, pos + 24).int
+        fileNameLen = read16(src, pos + 28).int
+        extraFieldLen = read16(src, pos + 30).int
+        fileCommentLen = read16(src, pos + 32).int
+        # diskNumberStart = read16(src, pos + 34)
+        # internalFileAttr = read16(src, pos + 36)
+        externalFileAttr = read32(src, pos + 38)
+        fileHeaderOffset = read32(src, pos + 42).int
+
+      pos += 46
+
+      if pos + fileNameLen > result.getSize():
+        failArchiveEOF()
+
+      let fileName = src.readStr(pos, fileNameLen)
+      pos += fileNameLen
+
+      # Parse extra field for zip64 extensions if needed
+      var
+        compressedSize64 = compressedSize
+        uncompressedSize64 = uncompressedSize
+        fileHeaderOffset64 = fileHeaderOffset
+
+      if extraFieldLen > 0:
+        let endExtraFields = pos + extraFieldLen
+        var extraFieldsOffset = pos
+        while extraFieldsOffset + 4 <= endExtraFields:
+          let
+            fieldId = read16(src, extraFieldsOffset)
+            fieldLen = read16(src, extraFieldsOffset + 2).int
+          extraFieldsOffset += 4
+
+          if fieldId != 1:
+            extraFieldsOffset += fieldLen
+          else:
+            # These are the zip64 sizes
+            var zip64ExtrasOffset = extraFieldsOffset
+
+            if uncompressedSize == 0xffffffff:
+              if zip64ExtrasOffset + 8 > extraFieldsOffset + fieldLen:
+                failArchiveEOF()
+              uncompressedSize64 = read64(src, zip64ExtrasOffset).int
+              zip64ExtrasOffset += 8
+
+            if compressedSize == 0xffffffff:
+              if zip64ExtrasOffset + 8 > extraFieldsOffset + fieldLen:
+                failArchiveEOF()
+              compressedSize64 = read64(src, zip64ExtrasOffset).int
+              zip64ExtrasOffset += 8
+
+            if fileHeaderOffset == 0xffffffff:
+              if zip64ExtrasOffset + 8 > extraFieldsOffset + fieldLen:
+                failArchiveEOF()
+              fileHeaderOffset64 = read64(src, zip64ExtrasOffset).int
+              zip64ExtrasOffset += 8
+            break
+
+      pos += extraFieldLen + fileCommentLen
+
+      if pos > socdOffset + centralDirectoryStart + centralDirectorySize:
+        raise newException(ZippyError, "Invalid central directory size")
+
+      let utf8FileName =
+        if (generalPurposeFlag and 0b100000000000) != 0:
+          # Language encoding flag (EFS) set, assume utf-8
+          fileName
+        else:
+          fileName.utf8ify()
+
+      let
+        dosDirectoryFlag = (externalFileAttr and 0x10) != 0
+        unixDirectoryFlag = (externalFileAttr and (S_IFDIR.uint32 shl 16)) != 0
+        recordKind =
+          if dosDirectoryFlag or unixDirectoryFlag or utf8FileName.endsWith("/"):
+            DirectoryRecord
+          else:
+            FileRecord
+
+      result.records[utf8FileName] = ZipArchiveRecord(
+        kind: recordKind,
+        fileHeaderOffset: fileHeaderOffset64.int + socdOffset,
+        path: utf8FileName,
+        compressedSize: compressedSize64,
+        uncompressedSize: uncompressedSize64,
+        uncompressedCrc32: uncompressedCrc32,
+        filePermissions: parseFilePermissions(externalFileAttr.int shr 16)
+      )
+  except IOError as e:
+    result.close()
+    raise e
+  except OSError as e:
+    result.close()
+    raise e
+  except ZippyError as e:
+    result.close()
+    raise e
+
 proc extractAll*(
   zipPath, dest: string
 ) {.raises: [IOError, OSError, ZippyError].} =
@@ -410,7 +654,7 @@ proc extractAll*(
 
   let
     reader = openZipArchive(zipPath)
-    src = cast[ptr UncheckedArray[uint8]](reader.memFile.mem)
+    src = reader.getData()
 
   # Verify some things before attempting to write the files
   for _, record in reader.records:
