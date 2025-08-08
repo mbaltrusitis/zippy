@@ -1,5 +1,5 @@
-import common, crc, internal, std/os, std/streams, std/strutils, std/tables,
-    std/times, zippy
+import common, crc, deflate, inflate, internal, std/os, std/streams, std/strutils, std/tables,
+    std/times
 
 export common
 
@@ -42,7 +42,7 @@ proc addDir(archive: ZipArchive, base, relative: string) =
 
 proc addDir*(
   archive: ZipArchive, dir: string
-) {.raises: [IOError, OSError, ZippyError].} =
+) {.deprecated: "Use ziparchives.nim API instead. This v1 API lacks deflate64 support and has known ZIP specification issues.", raises: [IOError, OSError, ZippyError].} =
   ## Recursively adds all of the files and directories inside dir to archive.
   if splitFile(dir).ext.len > 0:
     raise newException(
@@ -55,7 +55,7 @@ proc addDir*(
 
 proc addFile*(
   archive: ZipArchive, path: string
-) {.raises: [IOError, OSError, ZippyError].} =
+) {.deprecated: "Use ziparchives.nim API instead. This v1 API lacks deflate64 support and has known ZIP specification issues.", raises: [IOError, OSError, ZippyError].} =
   ## Adds a single file to the archive.
 
   let fileInfo = getFileInfo(path)
@@ -73,7 +73,7 @@ proc addFile*(
       "Error adding file " & path & " to archive, appears to be a directory?"
     )
 
-proc clear*(archive: ZipArchive) {.raises: [].} =
+proc clear*(archive: ZipArchive) {.deprecated: "Use ziparchives.nim API instead. This v1 API lacks deflate64 support and has known ZIP specification issues.", raises: [].} =
   archive.contents.clear()
 
 template failEOF() =
@@ -102,7 +102,7 @@ proc extractPermissions(externalFileAttr: uint32): set[FilePermission] =
     if (permissions and 0o00002) != 0: result.incl fpOthersWrite
     if (permissions and 0o00001) != 0: result.incl fpOthersExec
 
-proc openStreamImpl*(archive: ZipArchive, stream: Stream) =
+proc openStreamImpl*(archive: ZipArchive, stream: Stream) {.deprecated: "Use ziparchives.nim API instead. This v1 API lacks deflate64 support and has known ZIP specification issues.", raises: [IOError, OSError, ZippyError].} =
   let data = stream.readAll() # TODO: actually treat as a stream
 
   archive.clear()
@@ -203,7 +203,10 @@ proc openStreamImpl*(archive: ZipArchive, stream: Stream) =
         if compressionMethod == 0:
           data[pos ..< pos + compressedSize]
         else:
-          uncompress(data[pos ..< pos + compressedSize], dfDeflate)
+          block:
+            var result: string
+            inflate(result, cast[ptr UncheckedArray[uint8]](data[pos].addr), compressedSize, 0)
+            result
 
       if crc32(uncompressed) != uncompressedCrc32:
         raise newException(
@@ -343,7 +346,7 @@ else:
     ## archive.contents (clears any existing archive.contents entries).
     openStreamImpl(archive, stream)
 
-proc open*(archive: ZipArchive, path: string) {.inline.} =
+proc open*(archive: ZipArchive, path: string) {.deprecated: "Use ziparchives.nim API instead. This v1 API lacks deflate64 support and has known ZIP specification issues.", inline.} =
   ## Opens the zip archive file located at path and reads its contents into
   ## archive.contents (clears any existing archive.contents entries).
   archive.open(newStringStream(readFile(path)))
@@ -368,7 +371,7 @@ proc toMsDos(time: times.Time): (uint16, uint16) =
 
   (lastModifiedTime, lastModifiedDate)
 
-proc `$`*(archive: ZipArchive): string {.raises: [IOError, ZippyError].} =
+proc `$`*(archive: ZipArchive): string {.deprecated: "Use ziparchives.nim API instead. This v1 API lacks deflate64 support and has known ZIP specification issues.", raises: [IOError, ZippyError].} =
   ## Writes archive.contents to a zip file at path.
 
   if archive.contents.len == 0:
@@ -408,7 +411,10 @@ proc `$`*(archive: ZipArchive): string {.raises: [IOError, ZippyError].} =
 
     let compressed =
       if entry.contents.len > 0:
-        compress(entry.contents, DefaultCompression, dfDeflate)
+        block:
+          var result: string
+          deflate(result, cast[ptr UncheckedArray[uint8]](entry.contents[0].addr), entry.contents.len, DefaultCompression)
+          result
       else:
         ""
 
@@ -481,7 +487,7 @@ proc `$`*(archive: ZipArchive): string {.raises: [IOError, ZippyError].} =
   
 proc writeZipArchive*(
   archive: ZipArchive, path: string
-) {.raises: [IOError, ZippyError].} =
+) {.deprecated: "Use ziparchives.nim API instead. This v1 API lacks deflate64 support and has known ZIP specification issues.", raises: [IOError, ZippyError].} =
 
   let data = $(archive)
   
@@ -492,7 +498,7 @@ proc writeZipArchive*(
 
 proc extractAll*(
   archive: ZipArchive, dest: string
-) {.raises: [IOError, OSError, ZippyError].} =
+) {.deprecated: "Use ziparchives.nim API instead. This v1 API lacks deflate64 support and has known ZIP specification issues.", raises: [IOError, OSError, ZippyError].} =
   ## Extracts the files stored in archive to the destination directory.
   ## The path to the destination directory must exist.
   ## The destination directory itself must not exist (it is not overwitten).
@@ -552,7 +558,7 @@ proc extractAll*(
 
 proc createZipArchive*(
   source, dest: string
-) {.raises: [IOError, OSError, ZippyError].} =
+) {.deprecated: "Use ziparchives.nim API instead. This v1 API lacks deflate64 support and has known ZIP specification issues.", raises: [IOError, OSError, ZippyError].} =
   ## Creates an archive containing all of the files and directories inside
   ## source and writes the zip file to dest.
   let archive = ZipArchive()
