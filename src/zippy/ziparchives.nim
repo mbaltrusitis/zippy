@@ -509,9 +509,21 @@ proc openZipArchive*(
     if numRecordsOnDisk != numCentralDirectoryRecords:
       raise newException(ZippyError, "Number of entries mismatch")
 
-    let socdOffset = result.findStartOfCentralDirectory(eocd, numCentralDirectoryRecords)
+    # Handle zip archives being concatenated to the end (like self-extracting
+    # exe). This handles that by determining where the zip archive is from
+    # the start of the file.
+    let
+      socd =
+        try:
+          # Try to find the start relative to the end of the file, supporting
+          # zip archives being concatenated to the end. If this fails for any
+          # reason, fall back to the default behavior.
+          result.findStartOfCentralDirectory(eocd, numCentralDirectoryRecords)
+        except ZippyError:
+          centralDirectoryStart
+      socdOffset = socd - centralDirectoryStart
 
-    var pos = socdOffset
+    var pos = socdOffset + centralDirectoryStart
     for i in 0 ..< numCentralDirectoryRecords:
       if pos + 46 > result.getSize():
         failArchiveEOF()
